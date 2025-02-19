@@ -4,12 +4,12 @@ from pymongo import MongoClient
 import time
 
 # Datos de conexión a MongoDB Atlas
-MONGODB_URI = "mongodb+srv://<username>:<password>@<cluster-url>/test?retryWrites=true&w=majority"
+MONGODB_URI = "mongodb+srv://user:psw@gestiondatos.rrewd.mongodb.net/github?retryWrites=true&w=majority" #cambiar user y psw
 DB_NAME = 'github'
 COLLECTION_COMMITS = 'commits'
 
 # Datos de autenticación para GitHub
-token = '<tu-token-de-github>'
+token = '' # Ingresar token de autenticación
 headers = {
     "Authorization": f"token {token}",
     "Accept": "application/vnd.github.v3+json"
