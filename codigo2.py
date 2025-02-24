@@ -5,10 +5,10 @@ import time
 from datetime import datetime, timezone
 
 # Datos de conexión a MongoDB Atlas
-MONGODB_URI = "mongodb+srv://Usuario:contraseña@gestiondatos.rrewd.mongodb.net/github?retryWrites=true&w=majority"
+MONGODB_URI = "mongodb+srv://usuario:contraseña@gestiondatos.rrewd.mongodb.net/github?retryWrites=true&w=majority"
 
 # Datos de autenticación para GitHub
-token = 'introducirtokenaqui'
+token = 'token' # Reemplazar con un token válido
 headers = {
     "Authorization": f"token {token}",
     "Accept": "application/vnd.github.v3+json"
@@ -105,7 +105,6 @@ def estimate_total_commits():
         total_commits = total_pages * per_page
         print(f"Estimación basada en encabezado 'Link': {total_commits} commits.")
     else:
-        # Si no hay 'Link', estimar basado en la muestra (suponiendo 100 páginas como límite razonable)
         total_commits = commits_in_page * 100  # Extrapolación aproximada
         print(f"Estimación aproximada basada en muestra: {total_commits} commits (suponiendo 100 páginas).")
     
@@ -131,52 +130,60 @@ else:
     last_commit_date = start_date
 
 page = 1
-while True:
-    # Usar 'since' y 'until' para limitar el rango de commits
-    search_url = f'https://api.github.com/repos/{user}/{project}/commits?page={page}&per_page={per_page}&since={start_date}&until={last_commit_date}'
-    response = fetch_with_retries(search_url, headers)
-    
-    if not response or not response.json():
-        print("No se encontraron más commits o ocurrió un error.")
-        break
 
-    commits = response.json()
-    if not commits:
-        print("No hay más commits disponibles.")
-        break
+try:
+    while True:
+        # Usar 'since' y 'until' para limitar el rango de commits
+        search_url = f'https://api.github.com/repos/{user}/{project}/commits?page={page}&per_page={per_page}&since={start_date}&until={last_commit_date}'
+        response = fetch_with_retries(search_url, headers)
+        
+        if not response or not response.json():
+            print("No se encontraron más commits o ocurrió un error.")
+            break
 
-    for commit in commits:
-        commit_sha = commit['sha']
-        commit_url = commit['url']
+        commits = response.json()
+        if not commits:
+            print("No hay más commits disponibles.")
+            break
 
-        # Verificar si el commit ya existe
-        if collection_commits.find_one({"sha": commit_sha}):
-            print(f"Commit {commit_sha} ya existe en MongoDB, omitiendo...")
-            continue
+        for commit in commits:
+            commit_sha = commit['sha']
+            commit_url = commit['url']
 
-        # Obtener detalles del commit
-        commit_response = fetch_with_retries(commit_url, headers)
-        if not commit_response:
-            print(f"No se pudieron obtener detalles del commit {commit_sha}. Omitiendo...")
-            continue
+            # Verificar si el commit ya existe
+            if collection_commits.find_one({"sha": commit_sha}):
+                print(f"Commit {commit_sha} ya existe en MongoDB, omitiendo...")
+                continue
 
-        commit_data = commit_response.json()
-        files_modified = commit_data.get('files', [])
-        stats = commit_data.get('stats', {})
+            # Obtener detalles del commit
+            commit_response = fetch_with_retries(commit_url, headers)
+            if not commit_response:
+                print(f"No se pudieron obtener detalles del commit {commit_sha}. Omitiendo...")
+                continue
 
-        # Agregar campos nuevos al documento
-        commit['files_modified'] = files_modified
-        commit['stats'] = stats
-        commit['projectId'] = project
+            commit_data = commit_response.json()
+            files_modified = commit_data.get('files', [])
+            stats = commit_data.get('stats', {})
 
-        # Insertar en MongoDB
-        try:
-            collection_commits.insert_one(commit)
-            ingested_commits += 1
-            print(f"Commit {commit_sha} insertado en MongoDB. Progreso: {ingested_commits}/{total_commits_estimate}")
-        except Exception as e:
-            print(f"Error al insertar commit {commit_sha}: {e}")
+            # Agregar campos nuevos al documento
+            commit['files_modified'] = files_modified
+            commit['stats'] = stats
+            commit['projectId'] = project
 
-    page += 1
+            # Insertar en MongoDB
+            try:
+                collection_commits.insert_one(commit)
+                ingested_commits += 1
+                print(f"Commit {commit_sha} insertado en MongoDB. Progreso: {ingested_commits}/{total_commits_estimate}")
+            except Exception as e:
+                print(f"Error al insertar commit {commit_sha}: {e}")
+
+        page += 1
+
+except KeyboardInterrupt:
+    print("\n\nEjecución interrumpida manualmente con Ctrl + C. Proceso detenido.")
+    print(f"Commits ingestados hasta el momento: {ingested_commits} de un estimado de {total_commits_estimate}")
+    print("Hasta pronto!")
+    exit(0)
 
 print("Proceso completado.")
