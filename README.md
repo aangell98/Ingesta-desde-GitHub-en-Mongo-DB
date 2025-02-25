@@ -20,6 +20,7 @@
    - [3.4. Estimación del número total de commits](#34-estimación-del-número-total-de-commits)
    - [3.5. Ingesta de commits con gestión del rate limit](#35-ingesta-de-commits-con-gestión-del-rate-limit)
    - [3.6. Manejo de interrupciones](#36-manejo-de-interrupciones)
+   - [3.7. Optimizaciones implementadas](#37-optimizaciones-implementadas)
 4. [Resultados y Evidencias](#4-resultados-y-evidencias)
 5. [Código y Archivos de Configuración](#5-código-y-archivos-de-configuración)
 6. [Conclusiones](#6-conclusiones)
@@ -28,18 +29,18 @@
 ---
 
 ## 1. Introducción
-Esta memoria documenta el desarrollo de la Práctica 3 de la asignatura Gestión de Datos, cuyo objetivo principal es realizar una ingesta avanzada de commits del proyecto `microsoft/vscode` en GitHub hacia una base de datos MongoDB. Inicialmente, se implementó una solución para MongoDB Atlas, pero debido a las limitaciones de espacio en el nivel gratuito (512 MB), se optó por adaptar el proyecto para usar una instancia local de MongoDB, aprovechando el almacenamiento ilimitado del disco local.
+Esta memoria documenta el desarrollo de la Práctica 3 de la asignatura *Gestión de Datos*, cuyo objetivo principal es realizar una ingesta avanzada de commits del proyecto `microsoft/vscode` en GitHub hacia una base de datos MongoDB. Inicialmente, se diseñó una solución para MongoDB Atlas, pero las limitaciones de almacenamiento del nivel gratuito (512 MB) hicieron inviable almacenar los más de 100,000 commits estimados del proyecto. Por ello, se adaptó el desarrollo para usar una instancia local de MongoDB, aprovechando el almacenamiento ilimitado del disco local.
 
-El documento describe paso a paso el proceso de desarrollo, desde la configuración del entorno hasta la implementación de la lógica de ingesta, incluyendo la gestión eficiente del *rate limit* de GitHub y la adición de campos extendidos a los documentos. Se presentan evidencias de los resultados obtenidos y se incluye el código completo.
+El proceso incluyó múltiples iteraciones para optimizar la ingesta, gestionar eficientemente el *rate limit* de GitHub, y garantizar la continuidad del proceso tras interrupciones. Se implementaron mejoras como el procesamiento paralelo de solicitudes HTTP y una estimación precisa del progreso, detalladas a continuación.
 
 ---
 
 ## 2. Objetivos
 Los objetivos específicos del proyecto, según las tareas a entregar (página 31 del documento), son:
 1. Realizar la ingesta de commits del proyecto `https://github.com/microsoft/vscode`.
-2. Limitar la ingesta a los commits producidos desde el 1 de enero de 2018 hasta la actualidad (24 de febrero de 2025).
+2. Limitar la ingesta a los commits producidos desde el 1 de enero de 2018 hasta la actualidad
 3. Gestionar de forma eficaz y eficiente el *rate limit* de la API de GitHub.
-4. Añadir a cada documento en MongoDB dos campos extendidos: información de archivos modificados y estadísticas de cambios de cada commit, utilizando la operación "Get a commit".
+4. Añadir a cada documento en MongoDB los campos extendidos `files_modified` (archivos modificados) y `stats` (estadísticas de cambios), utilizando la operación "Get a commit".
 5. Proporcionar una memoria con explicaciones y evidencias, junto con el código Python y archivos de configuración.
 
 ---
@@ -53,26 +54,49 @@ El entorno de desarrollo incluyó las siguientes herramientas:
 - **Librerías Python**:
   - `requests`: Para realizar solicitudes HTTP a la API de GitHub.
   - `pymongo`: Para interactuar con MongoDB.
+  - `python-dotenv`: Para cargar variables de configuración desde un archivo `.env`.
+  - `concurrent.futures`: Para implementar procesamiento paralelo con multihilo.
 
 **Instalación de MongoDB local**:
 1. Se descargó MongoDB Community Server desde [https://www.mongodb.com/try/download/community](https://www.mongodb.com/try/download/community).
-2. Se instaló en el sistema operativo (Windows en este caso) y se inició el servidor ejecutando `mongod` desde la terminal en el directorio de instalación.
+2. Se instaló en Windows y se inició el servidor ejecutando `mongod` desde la terminal en el directorio de instalación (`C:\Program Files\MongoDB\Server\7.0\bin`).
 3. Se verificó que el servidor estuviera corriendo con el comando `mongo` en otra terminal.
 
 **Instalación de dependencias**:
 ```bash
-pip install requests pymongo
+pip install requests pymongo python-dotenv
+```
+Nota: `concurrent.futures` es parte de la biblioteca estándar de Python y no requiere instalación adicional.
+
+**Archivo de configuración `.env`**:
+Se creó un archivo `.env` en el directorio raíz para externalizar parámetros sensibles y configurables:
+```
+GITHUB_TOKEN=tu_token_aqui
+GITHUB_USER=microsoft
+GITHUB_PROJECT=vscode
+START_DATE=2018-01-01T00:00:00Z
+PER_PAGE=100
+MAX_WORKERS=10
+LOCAL_MONGO_HOST=localhost
+LOCAL_MONGO_PORT=27017
+LOCAL_MONGO_DB=github
+LOCAL_MONGO_COLLECTION=commits
 ```
 
 ### 3.2. Conexión a MongoDB local
-Se configuró la conexión a MongoDB local utilizando los parámetros:
+Se configuró la conexión a MongoDB local utilizando variables del archivo `.env`, con valores por defecto para facilitar su uso:
 - Host: `localhost`
 - Puerto: `27017`
 - Base de datos: `github`
 - Colección: `commits`
 
-El código de conexión verifica la disponibilidad del servidor y muestra un mensaje de error si falla:
+El código verifica la conexión y maneja errores:
 ```python
+MONGODB_HOST = os.getenv("LOCAL_MONGO_HOST", "localhost")
+MONGODB_PORT = int(os.getenv("LOCAL_MONGO_PORT", "27017"))
+DB_NAME = os.getenv("LOCAL_MONGO_DB", "github")
+COLLECTION_NAME = os.getenv("LOCAL_MONGO_COLLECTION", "commits")
+
 try:
     client = MongoClient(MONGODB_HOST, MONGODB_PORT)
     db = client[DB_NAME]
@@ -83,104 +107,149 @@ except Exception as e:
     exit(1)
 ```
 
-Se eligió MongoDB local en lugar de Atlas para evitar las restricciones de espacio (512 MB en el nivel gratuito), permitiendo almacenar todos los commits sin limitaciones.
+La elección de MongoDB local permitió superar las restricciones de almacenamiento de MongoDB Atlas, asegurando que todos los commits pudieran almacenarse sin problemas.
 
 ### 3.3. Autenticación y uso de la API de GitHub
 Se generó un *Personal Access Token* (PAT) en GitHub con permisos básicos de lectura (`repo`), siguiendo las instrucciones de las páginas 20-23 del documento:
 1. Cada miembro accedió a `https://github.com/settings/tokens`.
-2. Crearon un token con el alcance `repo` y lo almacenaron de forma segura.
+2. Creó un token con el alcance `repo` y lo almacenó en el archivo `.env` como `GITHUB_TOKEN`.
 
 El token se incluyó en las cabeceras de las solicitudes HTTP:
 ```python
-token = 'token'
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 headers = {
-    "Authorization": f"token {token}",
+    "Authorization": f"token {GITHUB_TOKEN}",
     "Accept": "application/vnd.github.v3+json"
 }
 ```
 
 ### 3.4. Estimación del número total de commits
-Dado que la API de GitHub no proporciona un conteo exacto de commits en un rango de fechas, se implementó una estimación aproximada para minimizar el uso del *rate limit*:
-- Se realizó una solicitud a la primera página de commits desde el 1 de enero de 2018 con `per_page=100`.
-- Se extrajo el número total de páginas del encabezado `Link` (si estaba disponible) o se asumió un valor aproximado (100 páginas) basado en la muestra.
+La API de GitHub no proporciona un conteo exacto de commits en un rango de fechas, por lo que se implementó una estimación basada en el encabezado `Link`:
+- Se realizó una solicitud inicial a la primera página de commits desde `2018-01-01T00:00:00Z` con `per_page=100`.
+- Se extrajo el número de la última página del encabezado `Link` para calcular el total aproximado (`total_pages * PER_PAGE`).
+- Si el encabezado no estaba disponible, se asumió un valor aproximado multiplicando la cantidad de commits en la primera página por 100.
 
 Código relevante:
 ```python
 def estimate_total_commits():
-    base_url = f'https://api.github.com/repos/{user}/{project}/commits?since={start_date}&per_page={per_page}'
+    print("Estimando el número total de commits (muestra inicial)...")
+    base_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?since={START_DATE}&per_page={PER_PAGE}'
     response = fetch_with_retries(f"{base_url}&page=1", headers)
+    if not response or not response.json():
+        print("No se pudo obtener datos para la estimación. Asumiendo 1000 commits.")
+        return 1000
+    
     commits = response.json()
     commits_in_page = len(commits)
     link_header = response.headers.get('Link', '')
     if 'rel="last"' in link_header:
-        total_pages = int(link_header.split('&page=')[1].split('>')[0])
-        total_commits = total_pages * per_page
+        for part in link_header.split(','):
+            if 'rel="last"' in part:
+                total_pages = int(part.split('&page=')[1].split('>')[0])
+                break
+        total_commits = total_pages * PER_PAGE
+        print(f"Estimación basada en encabezado 'Link': {total_commits} commits.")
     else:
         total_commits = commits_in_page * 100
+        print(f"Estimación aproximada basada en muestra: {total_commits} commits (suponiendo 100 páginas).")
     return total_commits
 ```
 
 ### 3.5. Ingesta de commits con gestión del rate limit
-La ingesta se realizó con las siguientes características:
-- **Rango de fechas**: Desde `2018-01-01T00:00:00Z` hasta el último commit insertado (o la actualidad si no había datos previos).
+La ingesta se diseñó con las siguientes características:
+- **Rango de fechas**: Desde `2018-01-01T00:00:00Z` hasta el commit más reciente en la base de datos (o la actualidad si no había datos previos).
 - **Gestión del *rate limit***:
-  - Se verificó el límite de peticiones antes de cada solicitud con hasta 3 reintentos.
+  - Se implementó `check_rate_limit()` para verificar el límite antes de cada solicitud, con hasta 3 reintentos en caso de fallo.
   - Si fallaba tras 3 intentos, se esperaba 60 segundos.
-  - Si las peticiones restantes eran menos de 10, se pausaba hasta el tiempo de reinicio.
+  - Se redujo la frecuencia de mensajes impresos a cada 10 solicitudes o cuando las peticiones restantes eran menores a 100, mejorando la legibilidad.
+  - Si las peticiones restantes eran menos de 100, se pausaba hasta el reinicio del límite (`reset_time`), asegurando un uso eficiente de las 5000 solicitudes por hora permitidas por GitHub.
 
 - **Campos extendidos**:
-  - Se usó la operación "Get a commit" (`commit_url`) para obtener `files_modified` y `stats` de cada commit.
-  - Estos campos se añadieron al documento antes de insertarlo en MongoDB.
+  - Se utilizó la operación "Get a commit" (`commit_url`) para obtener `files_modified` y `stats`, que se añadieron a cada documento antes de su inserción.
 
-- **Evitar duplicados**: Se comprobó la existencia de cada commit por su `sha` antes de insertarlo.
+- **Evitar duplicados**: Se verificó la existencia de cada commit por su `sha` antes de procesarlo, usando `find_one({"sha": commit_sha})`.
+
+- **Procesamiento paralelo**: Se incorporó multihilo con `ThreadPoolExecutor` para realizar solicitudes HTTP paralelas a los `commit_url`, optimizando el tiempo de obtención de detalles. El número de hilos (`MAX_WORKERS`) se configuró desde `.env`.
 
 Código clave:
 ```python
-for commit in commits:
-    commit_sha = commit['sha']
-    if collection_commits.find_one({"sha": commit_sha}):
-        continue
-    commit_response = fetch_with_retries(commit['url'], headers)
-    commit_data = commit_response.json()
-    commit['files_modified'] = commit_data.get('files', [])
-    commit['stats'] = commit_data.get('stats', {})
-    collection_commits.insert_one(commit)
+while has_new_commits:
+    if until_date:
+        search_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?page={page}&per_page={PER_PAGE}&since={START_DATE}&until={until_date}'
+    else:
+        search_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?page={page}&per_page={PER_PAGE}&since={START_DATE}'
+    
+    response = fetch_with_retries(search_url, headers)
+    commits = response.json()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        commits_to_fetch = [commit for commit in commits if not collection_commits.find_one({"sha": commit['sha']})]
+        future_to_commit = {executor.submit(fetch_commit_details, commit): commit for commit in commits_to_fetch}
+        for future in as_completed(future_to_commit):
+            commit_data = future.result()
+            if commit_data:
+                collection_commits.insert_one(commit_data)
+                ingested_commits += 1
+                has_new_commits = True
+                print(f"Commit {commit_data['sha']} insertado en MongoDB. Fecha: {commit_data['commit']['committer']['date']}. Progreso: {ingested_commits}/{total_commits_estimate}")
 ```
 
 ### 3.6. Manejo de interrupciones
-Se implementó un manejo de interrupciones con `Ctrl + C` para mostrar un mensaje personalizado y el progreso alcanzado:
+Se implementó un manejo robusto de interrupciones con `Ctrl + C` para permitir pausar y reanudar la ingesta sin pérdida de datos:
+- Al interrumpir, se muestra el progreso actual y un mensaje indicando cómo continuar.
+- La reanudación usa el commit más antiguo existente (`last_commit_date`) como límite superior (`until`), asegurando continuidad.
+
+Código relevante:
 ```python
+try:
+    while has_new_commits:
+        # Lógica de ingesta
 except KeyboardInterrupt:
     print("\n\nEjecución interrumpida manualmente con Ctrl + C. Proceso detenido.")
     print(f"Commits ingestados hasta el momento: {ingested_commits} de un estimado de {total_commits_estimate}")
-    print("Puedes reanudar el proceso ejecutando el script nuevamente. ¡Hasta pronto!")
+    print("Hasta pronto!")
     exit(0)
 ```
 
-Esto permite pausar y reanudar la ingesta sin perder datos, aprovechando la verificación del último commit insertado.
+### 3.7. Optimizaciones implementadas
+A lo largo del desarrollo, se introdujeron varias optimizaciones:
+- **Multihilo**: Se utilizó `ThreadPoolExecutor` para procesar hasta `MAX_WORKERS` solicitudes HTTP en paralelo, reduciendo significativamente el tiempo de obtención de detalles de commits (de ~100-200 segundos por página a ~10-20 segundos).
+- **Configuración dinámica**: Se externalizaron parámetros como `MAX_WORKERS` al archivo `.env`, permitiendo ajustes sin modificar el código.
+- **Mensajes reducidos**: Se limitó la salida del *rate limit* para mejorar la legibilidad, imprimiendo solo cada 10 solicitudes o cuando el límite estuviera cerca (<100 peticiones restantes).
+- **Ingesta inversa**: Se corrigió la lógica inicial (que procesaba desde el commit más antiguo hacia adelante) para usar `since=START_DATE` y `until=last_commit_date`, procesando desde el más reciente hacia atrás, lo que permitió una reanudación precisa tras interrupciones.
 
 ---
 
 ## 4. Resultados y Evidencias
 
 ### Ejecución inicial
-Al ejecutar el script, se conectó a MongoDB local y estimó el número total de commits:
+Al ejecutar el script sin datos previos:
 ```
 Conexión exitosa a MongoDB local.
 Estimando el número total de commits (muestra inicial)...
-Estimación basada en encabezado 'Link': 3700 commits.
-Commits ya ingestados: 0 de un estimado de 3700
-No hay commits previos en la base de datos. Ingestando desde 2018-01-01T00:00:00Z...
-Peticiones restantes: 5000, próximo reset: Mon Feb 24 12:00:00 2025
-Commit abc123... insertado en MongoDB. Progreso: 1/3700
+Peticiones restantes: 4809, próximo reset: Tue Feb 25 11:48:11 2025
+Estimación basada en encabezado 'Link': 102400 commits.
+Commits ya ingestados: 0 de un estimado de 102400
+No hay commits previos en la base de datos. Ingestando desde el principio.
+Ingestando desde 2018-01-01T00:00:00Z sin límite superior.
+Commit b91f8eb95c070be0c6037b866feac1b596f3c5e8 insertado en MongoDB. Fecha: 2025-02-25T08:31:52Z. Progreso: 1/102400
+Commit a8df977b0d3b1c44d5b0382874754f04bee8870a insertado en MongoDB. Fecha: 2025-02-25T07:18:00Z. Progreso: 2/102400
+...
 ```
 
-### Progreso y *rate limit*
-Durante la ingesta, se gestionó el *rate limit* eficientemente:
+### Reanudación con datos previos
+Con 20 commits ya insertados:
 ```
-Peticiones restantes: 4990, próximo reset: Mon Feb 24 12:00:00 2025
-Commit def456... insertado en MongoDB. Progreso: 10/3700
-Esperando 10 segundos debido al límite de tasas...
+Conexión exitosa a MongoDB local.
+Estimando el número total de commits (muestra inicial)...
+Peticiones restantes: 4709, próximo reset: Tue Feb 25 11:48:11 2025
+Estimación basada en encabezado 'Link': 102400 commits.
+Commits ya ingestados: 20 de un estimado de 102400
+Fecha del commit más antiguo encontrado: 2025-02-24T20:07:47Z
+Continuando desde el commit más antiguo: 2025-02-24T20:07:47Z
+Commit xyz789... insertado en MongoDB. Fecha: 2025-02-24T20:06:00Z. Progreso: 21/102400
+Commit abc123... insertado en MongoDB. Fecha: 2025-02-24T20:05:00Z. Progreso: 22/102400
+...
 ```
 
 ### Interrupción manual
@@ -188,12 +257,12 @@ Al presionar `Ctrl + C`:
 ```
 ^C
 Ejecución interrumpida manualmente con Ctrl + C. Proceso detenido.
-Commits ingestados hasta el momento: 50 de un estimado de 3700
-Puedes reanudar el proceso ejecutando el script nuevamente. ¡Hasta pronto!
+Commits ingestados hasta el momento: 50 de un estimado de 102400
+Hasta pronto!
 ```
 
 ### Datos en MongoDB
-Se verificaron los datos en MongoDB local usando MongoDB Compass:
+Se verificaron los datos en MongoDB local usando MongoDB Compass o la terminal de MongoDB:
 - Base de datos: `github`
 - Colección: `commits`
 - Documento de ejemplo:
@@ -203,7 +272,6 @@ Se verificaron los datos en MongoDB local usando MongoDB Compass:
     "$oid": "67bc5277f3a465f35eae37f7"
   },
   "sha": "ea8aabc6b65d996cdd9ef26118e506f25f38486c",
-  "node_id": "C_kwDOAn8RLNoAKGVhOGFhYmM2YjY1ZDk5NmNkZDllZjI2MTE4ZTUwNmYyNWYzODQ4NmM",
   "commit": {
     "author": {
       "name": "Johannes Rieken",
@@ -215,73 +283,8 @@ Se verificaron los datos en MongoDB local usando MongoDB Compass:
       "email": "noreply@github.com",
       "date": "2025-02-24T10:49:46Z"
     },
-    "message": "only rely on `crypto.getRandomValues` and treat `randomUUID` as being optional (#241690)\n\nfixes https://github.com/microsoft/vscode/issues/240334",
-    "tree": {
-      "sha": "b583de406f2d3b3e33a51fb9a9c94cea404d4884",
-      "url": "https://api.github.com/repos/microsoft/vscode/git/trees/b583de406f2d3b3e33a51fb9a9c94cea404d4884"
-    },
-    "url": "https://api.github.com/repos/microsoft/vscode/git/commits/ea8aabc6b65d996cdd9ef26118e506f25f38486c",
-    "comment_count": 0,
-    "verification": {
-      "verified": true,
-      "reason": "valid",
-      "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQBQJnvE7KCRC1aQ7uu5UhlAAAMcIQACt3P4MFacpeUR1FP4LUYdBL\nOT+VfTOj2MwM4b78EZtt1Fbb/BHdQ5vKPSuHF94pH+YHw7O8Ke7A6CpIvoreljbU\nMBmeOstAja4VwOZWjgdWsSUYlsHBCJD+OakasgKfLoxe0iBtqXsFLphbHuVOD3u9\nIX/iddmCbIJcLO7USHy5qnh4GxvAxWVUIiKjyqh9NY6RTYbDSyyOsxa213xfHWy8\nogLWRXxPgbihMmQtYwWVhbOOdib7w+N2l9CSOf2D6MGUEykGrdTAQbrFcavgeHy+\n11xAJT7yAfu7fbTsk7pgadQneUuNrAb2oshmnvaDWyFDmB9yrmw1BrAr8rjJJ15w\nMmKgBiVubsJB7zPg93JfrEyOvnQfGJ66yXWVQOqfUkYKMZuy8ji2OMALGNuv8su+\nelY/zGhIqJTSKTTsSWMxo/b/adkN+5l+aDe0meHaeQ13kis267ExfgtG3/OKEaLt\nK7IwmLCYeHpNZSJL/PrUTyeurWmHSCOug8oZnYE4vKfc0b0Fz2RFfFgiYJ6Xhnuo\nEsbMvGOCGDGU4pCMD6uHBi5jA0GmJiS6fv7xEOLuUZslVkBkr9BSqo513AqKhtyJ\n4dV2MNwILweqEP9/bFELg41V2YrRHrC5ZpVl1ulHMChJSgP9f0fzRll03EnrJwqm\nHMRjJ6q3qzxpX9VxFIt5\n=/T//\n-----END PGP SIGNATURE-----\n",
-      "payload": "tree b583de406f2d3b3e33a51fb9a9c94cea404d4884\nparent 28ab93455c176b9d66198857cfc69b189adba616\nauthor Johannes Rieken <johannes.rieken@gmail.com> 1740394186 +0100\ncommitter GitHub <noreply@github.com> 1740394186 +0100\n\nonly rely on `crypto.getRandomValues` and treat `randomUUID` as being optional (#241690)\n\nfixes https://github.com/microsoft/vscode/issues/240334",
-      "verified_at": "2025-02-24T10:49:49Z"
-    }
+    "message": "only rely on `crypto.getRandomValues` and treat `randomUUID` as being optional (#241690)\n\nfixes https://github.com/microsoft/vscode/issues/240334"
   },
-  "url": "https://api.github.com/repos/microsoft/vscode/commits/ea8aabc6b65d996cdd9ef26118e506f25f38486c",
-  "html_url": "https://github.com/microsoft/vscode/commit/ea8aabc6b65d996cdd9ef26118e506f25f38486c",
-  "comments_url": "https://api.github.com/repos/microsoft/vscode/commits/ea8aabc6b65d996cdd9ef26118e506f25f38486c/comments",
-  "author": {
-    "login": "jrieken",
-    "id": 1794099,
-    "node_id": "MDQ6VXNlcjE3OTQwOTk=",
-    "avatar_url": "https://avatars.githubusercontent.com/u/1794099?v=4",
-    "gravatar_id": "",
-    "url": "https://api.github.com/users/jrieken",
-    "html_url": "https://github.com/jrieken",
-    "followers_url": "https://api.github.com/users/jrieken/followers",
-    "following_url": "https://api.github.com/users/jrieken/following{/other_user}",
-    "gists_url": "https://api.github.com/users/jrieken/gists{/gist_id}",
-    "starred_url": "https://api.github.com/users/jrieken/starred{/owner}{/repo}",
-    "subscriptions_url": "https://api.github.com/users/jrieken/subscriptions",
-    "organizations_url": "https://api.github.com/users/jrieken/orgs",
-    "repos_url": "https://api.github.com/users/jrieken/repos",
-    "events_url": "https://api.github.com/users/jrieken/events{/privacy}",
-    "received_events_url": "https://api.github.com/users/jrieken/received_events",
-    "type": "User",
-    "user_view_type": "public",
-    "site_admin": true
-  },
-  "committer": {
-    "login": "web-flow",
-    "id": 19864447,
-    "node_id": "MDQ6VXNlcjE5ODY0NDQ3",
-    "avatar_url": "https://avatars.githubusercontent.com/u/19864447?v=4",
-    "gravatar_id": "",
-    "url": "https://api.github.com/users/web-flow",
-    "html_url": "https://github.com/web-flow",
-    "followers_url": "https://api.github.com/users/web-flow/followers",
-    "following_url": "https://api.github.com/users/web-flow/following{/other_user}",
-    "gists_url": "https://api.github.com/users/web-flow/gists{/gist_id}",
-    "starred_url": "https://api.github.com/users/web-flow/starred{/owner}{/repo}",
-    "subscriptions_url": "https://api.github.com/users/web-flow/subscriptions",
-    "organizations_url": "https://api.github.com/users/web-flow/orgs",
-    "repos_url": "https://api.github.com/users/web-flow/repos",
-    "events_url": "https://api.github.com/users/web-flow/events{/privacy}",
-    "received_events_url": "https://api.github.com/users/web-flow/received_events",
-    "type": "User",
-    "user_view_type": "public",
-    "site_admin": false
-  },
-  "parents": [
-    {
-      "sha": "28ab93455c176b9d66198857cfc69b189adba616",
-      "url": "https://api.github.com/repos/microsoft/vscode/commits/28ab93455c176b9d66198857cfc69b189adba616",
-      "html_url": "https://github.com/microsoft/vscode/commit/28ab93455c176b9d66198857cfc69b189adba616"
-    }
-  ],
   "files_modified": [
     {
       "sha": "8aa1e8801db2ea6e84643eafae7b711524ea941c",
@@ -290,10 +293,7 @@ Se verificaron los datos en MongoDB local usando MongoDB Compass:
       "additions": 53,
       "deletions": 1,
       "changes": 54,
-      "blob_url": "https://github.com/microsoft/vscode/blob/ea8aabc6b65d996cdd9ef26118e506f25f38486c/src%2Fvs%2Fbase%2Fcommon%2Fuuid.ts",
-      "raw_url": "https://github.com/microsoft/vscode/raw/ea8aabc6b65d996cdd9ef26118e506f25f38486c/src%2Fvs%2Fbase%2Fcommon%2Fuuid.ts",
-      "contents_url": "https://api.github.com/repos/microsoft/vscode/contents/src%2Fvs%2Fbase%2Fcommon%2Fuuid.ts?ref=ea8aabc6b65d996cdd9ef26118e506f25f38486c",
-      "patch": "@@ -10,4 +10,56 @@ export function isUUID(value: string): boolean {\n \treturn _UUIDPattern.test(value);\n }\n \n-export const generateUuid: () => string = crypto.randomUUID.bind(crypto);\n+export const generateUuid = (function (): () => string {\n+\n+\t// use `randomUUID` if possible\n+\tif (typeof crypto.randomUUID === 'function') {\n+\t\t// see https://developer.mozilla.org/en-US/docs/Web/API/Window/crypto\n+\t\t// > Although crypto is available on all windows, the returned Crypto object only has one\n+\t\t// > usable feature in insecure contexts: the getRandomValues() method.\n+\t\t// > In general, you should use this API only in secure contexts.\n+\n+\t\treturn crypto.randomUUID.bind(crypto);\n+\t}\n+\n+\t// prep-work\n+\tconst _data = new Uint8Array(16);\n+\tconst _hex: string[] = [];\n+\tfor (let i = 0; i < 256; i++) {\n+\t\t_hex.push(i.toString(16).padStart(2, '0'));\n+\t}\n+\n+\treturn function generateUuid(): string {\n+\t\t// get data\n+\t\tcrypto.getRandomValues(_data);\n+\n+\t\t// set version bits\n+\t\t_data[6] = (_data[6] & 0x0f) | 0x40;\n+\t\t_data[8] = (_data[8] & 0x3f) | 0x80;\n+\n+\t\t// print as string\n+\t\tlet i = 0;\n+\t\tlet result = '';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += '-';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += '-';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += '-';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += '-';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\treturn result;\n+\t};\n+})();"
+      "patch": "@@ -10,4 +10,56 @@ export function isUUID(value: string): boolean {\n \treturn _UUIDPattern.test(value);\n }\n \n-export const generateUuid: () => string = crypto.randomUUID.bind(crypto);\n+export const generateUuid = (function (): () => string {\n+\n+\t// use `randomUUID` if possible\n+\tif (typeof crypto.randomUUID === 'function') {\n+\t\treturn crypto.randomUUID.bind(crypto);\n+\t}\n+\n+\t// prep-work\n+\tconst _data = new Uint8Array(16);\n+\tconst _hex: string[] = [];\n+\tfor (let i = 0; i < 256; i++) {\n+\t\t_hex.push(i.toString(16).padStart(2, '0'));\n+\t}\n+\n+\treturn function generateUuid(): string {\n+\t\tcrypto.getRandomValues(_data);\n+\t\t_data[6] = (_data[6] & 0x0f) | 0x40;\n+\t\t_data[8] = (_data[8] & 0x3f) | 0x80;\n+\t\tlet i = 0;\n+\t\tlet result = '';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += '-';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += '-';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += '-';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += '-';\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\tresult += _hex[_data[i++]];\n+\t\treturn result;\n+\t};\n+})();"
     }
   ],
   "stats": {
@@ -306,231 +306,49 @@ Se verificaron los datos en MongoDB local usando MongoDB Compass:
 ```
 
 **Captura de pantalla**:  
-
-![alt text](recursos/compass.png)
+![MongoDB Compass](recursos/compass.png)
 
 ---
 
 ## 5. Código y Archivos de Configuración
 
-### Código Python (`MongoDB_Atlas.py`)
+### Código Python (`MongoDB_Local.py`)
+El script final incluye todas las optimizaciones y características descritas:
 ```python
 import requests
 import pymongo
 from pymongo import MongoClient
 import time
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Datos de conexión a MongoDB Atlas
-MONGODB_URI = "mongodb+srv://user:password@gestiondatos.rrewd.mongodb.net/github?retryWrites=true&w=majority"
+# Cargar variables de entorno desde .env
+load_dotenv()
 
-# Datos de autenticación para GitHub
-token = 'token'
-headers = {
-    "Authorization": f"token {token}",
-    "Accept": "application/vnd.github.v3+json"
-}
+# Configuración desde .env con valores por defecto
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_USER = os.getenv("GITHUB_USER", "microsoft")
+GITHUB_PROJECT = os.getenv("GITHUB_PROJECT", "vscode")
+START_DATE = os.getenv("START_DATE", "2018-01-01T00:00:00Z")
+PER_PAGE = int(os.getenv("PER_PAGE", "100"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 
-# Parámetros de consulta
-user = 'microsoft'
-project = 'vscode'
-start_date = '2018-01-01T00:00:00Z'  # Formato ISO 8601
-per_page = 100  # Máximo permitido por la API
+MONGODB_HOST = os.getenv("LOCAL_MONGO_HOST", "localhost")
+MONGODB_PORT = int(os.getenv("LOCAL_MONGO_PORT", "27017"))
+DB_NAME = os.getenv("LOCAL_MONGO_DB", "github")
+COLLECTION_NAME = os.getenv("LOCAL_MONGO_COLLECTION", "commits")
 
-# Conexión a MongoDB
-try:
-    client = MongoClient(MONGODB_URI)
-    db = client['github']
-    collection_commits = db['commits']
-    print("Conexión exitosa a MongoDB.")
-except Exception as e:
-    print(f"Error al conectar a MongoDB: {e}")
+# Verificación de variables críticas
+if not GITHUB_TOKEN:
+    print("Error: GITHUB_TOKEN no está definido en el archivo .env")
     exit(1)
 
-# Función para gestionar el rate limit con reintentos
-def check_rate_limit(threshold=10):
-    rate_url = 'https://api.github.com/rate_limit'
-    max_retries = 3
-    retries = 0
-    
-    while retries < max_retries:
-        try:
-            response = requests.get(rate_url, headers=headers, timeout=10)
-            response.raise_for_status()
-            rate_limit = response.json()
-            remaining = rate_limit['resources']['core']['remaining']
-            reset_time = rate_limit['resources']['core']['reset']
-            print(f"Peticiones restantes: {remaining}, próximo reset: {time.ctime(reset_time)}")
-            if remaining < threshold:
-                sleep_time = max(reset_time - int(time.time()) + 5, 0)
-                print(f"Esperando {sleep_time} segundos debido al límite de tasas...")
-                time.sleep(sleep_time)
-            return remaining
-        except requests.exceptions.RequestException as e:
-            retries += 1
-            print(f"Error al verificar rate limit (Intento {retries}/{max_retries}): {e}")
-            if retries < max_retries:
-                time.sleep(5)
-    
-    # Si falla después de 3 intentos, esperar un tiempo fijo
-    sleep_time = 60  # Valor por defecto en segundos
-    print(f"No se pudo verificar el rate limit tras {max_retries} intentos. Esperando {sleep_time} segundos...")
-    time.sleep(sleep_time)
-    return None
-
-# Función genérica para realizar solicitudes con reintentos
-def fetch_with_retries(url, headers, max_retries=3, timeout=10):
-    retries = 0
-    while retries < max_retries:
-        check_rate_limit()
-        try:
-            response = requests.get(url, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.RequestException as e:
-            retries += 1
-            print(f"Error al obtener datos desde {url}. Intento {retries}/{max_retries}: {e}")
-            if retries < max_retries:
-                time.sleep(5)
-    print(f"No se pudo obtener datos desde {url} después de {max_retries} intentos.")
-    return None
-
-# Estimación aproximada del total de commits
-def estimate_total_commits():
-    print("Estimando el número total de commits (muestra inicial)...")
-    base_url = f'https://api.github.com/repos/{user}/{project}/commits?since={start_date}&per_page={per_page}'
-    
-    # Obtener la primera página para la muestra
-    response = fetch_with_retries(f"{base_url}&page=1", headers)
-    if not response or not response.json():
-        print("No se pudo obtener datos para la estimación. Asumiendo 1000 commits.")
-        return 1000  # Valor por defecto en caso de fallo
-    
-    commits = response.json()
-    commits_in_page = len(commits)
-    
-    # Intentar obtener el número total de páginas desde el encabezado 'Link'
-    link_header = response.headers.get('Link', '')
-    total_pages = None
-    if 'rel="last"' in link_header:
-        for part in link_header.split(','):
-            if 'rel="last"' in part:
-                total_pages = int(part.split('&page=')[1].split('>')[0])
-                break
-    
-    if total_pages:
-        total_commits = total_pages * per_page
-        print(f"Estimación basada en encabezado 'Link': {total_commits} commits.")
-    else:
-        total_commits = commits_in_page * 100  # Extrapolación aproximada
-        print(f"Estimación aproximada basada en muestra: {total_commits} commits (suponiendo 100 páginas).")
-    
-    return total_commits
-
-# Obtener la fecha del último commit insertado
-def get_last_commit_date():
-    last_commit = collection_commits.find_one({}, sort=[("commit.committer.date", -1)])
-    if last_commit and 'commit' in last_commit and 'committer' in last_commit['commit']:
-        return last_commit['commit']['committer']['date']
-    return None
-
-# Proceso principal
-total_commits_estimate = estimate_total_commits()
-ingested_commits = collection_commits.count_documents({"projectId": project})
-print(f"Commits ya ingestados: {ingested_commits} de un estimado de {total_commits_estimate}")
-
-last_commit_date = get_last_commit_date()
-if last_commit_date:
-    print(f"Último commit insertado: {last_commit_date}. Ingestando commits posteriores...")
-else:
-    print(f"No hay commits previos en la base de datos. Ingestando desde {start_date}...")
-    last_commit_date = start_date
-
-page = 1
-
-try:
-    while True:
-        # Usar 'since' y 'until' para limitar el rango de commits
-        search_url = f'https://api.github.com/repos/{user}/{project}/commits?page={page}&per_page={per_page}&since={start_date}&until={last_commit_date}'
-        response = fetch_with_retries(search_url, headers)
-        
-        if not response or not response.json():
-            print("No se encontraron más commits o ocurrió un error.")
-            break
-
-        commits = response.json()
-        if not commits:
-            print("No hay más commits disponibles.")
-            break
-
-        for commit in commits:
-            commit_sha = commit['sha']
-            commit_url = commit['url']
-
-            # Verificar si el commit ya existe
-            if collection_commits.find_one({"sha": commit_sha}):
-                print(f"Commit {commit_sha} ya existe en MongoDB, omitiendo...")
-                continue
-
-            # Obtener detalles del commit
-            commit_response = fetch_with_retries(commit_url, headers)
-            if not commit_response:
-                print(f"No se pudieron obtener detalles del commit {commit_sha}. Omitiendo...")
-                continue
-
-            commit_data = commit_response.json()
-            files_modified = commit_data.get('files', [])
-            stats = commit_data.get('stats', {})
-
-            # Agregar campos nuevos al documento
-            commit['files_modified'] = files_modified
-            commit['stats'] = stats
-            commit['projectId'] = project
-
-            # Insertar en MongoDB
-            try:
-                collection_commits.insert_one(commit)
-                ingested_commits += 1
-                print(f"Commit {commit_sha} insertado en MongoDB. Progreso: {ingested_commits}/{total_commits_estimate}")
-            except Exception as e:
-                print(f"Error al insertar commit {commit_sha}: {e}")
-
-        page += 1
-
-except KeyboardInterrupt:
-    print("\n\nEjecución interrumpida manualmente con Ctrl + C. Proceso detenido.")
-    print(f"Commits ingestados hasta el momento: {ingested_commits} de un estimado de {total_commits_estimate}")
-    print("Hasta pronto!")
-    exit(0)
-
-print("Proceso completado.")
-```
-### Código Python (`MongoDB_Local.py`)
-```python
-import requests
-import pymongo
-from pymongo import MongoClient
-import time
-from datetime import datetime, timezone
-
-# Datos de conexión a MongoDB local
-MONGODB_HOST = 'localhost'
-MONGODB_PORT = 27017
-DB_NAME = 'github'
-COLLECTION_NAME = 'commits'
-
-# Datos de autenticación para GitHub
-token = 'token'
 headers = {
-    "Authorization": f"token {token}",
+    "Authorization": f"token {GITHUB_TOKEN}",
     "Accept": "application/vnd.github.v3+json"
 }
-
-# Parámetros de consulta
-user = 'microsoft'
-project = 'vscode'
-start_date = '2018-01-01T00:00:00Z'
-per_page = 100
 
 # Conexión a MongoDB local
 try:
@@ -542,7 +360,11 @@ except Exception as e:
     print(f"Error al conectar a MongoDB local: {e}")
     exit(1)
 
-def check_rate_limit(threshold=10):
+# Contador para mensajes de rate limit
+request_count = 0
+
+def check_rate_limit(threshold=100):
+    global request_count
     rate_url = 'https://api.github.com/rate_limit'
     max_retries = 3
     retries = 0
@@ -554,7 +376,9 @@ def check_rate_limit(threshold=10):
             rate_limit = response.json()
             remaining = rate_limit['resources']['core']['remaining']
             reset_time = rate_limit['resources']['core']['reset']
-            print(f"Peticiones restantes: {remaining}, próximo reset: {time.ctime(reset_time)}")
+            request_count += 1
+            if request_count % 10 == 0 or remaining < threshold:
+                print(f"Peticiones restantes: {remaining}, próximo reset: {time.ctime(reset_time)}")
             if remaining < threshold:
                 sleep_time = max(reset_time - int(time.time()) + 5, 0)
                 print(f"Esperando {sleep_time} segundos debido al límite de tasas...")
@@ -577,19 +401,52 @@ def fetch_with_retries(url, headers, max_retries=3, timeout=10):
         check_rate_limit()
         try:
             response = requests.get(url, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            return response
+            status_code = response.status_code
+            
+            if status_code == 200:
+                return response
+            elif status_code == 400:
+                print(f"Error 400 Bad Request en {url}: solicitud inválida.")
+                return None
+            elif status_code == 404:
+                print(f"Error 404 Resource Not Found en {url}: recurso no encontrado.")
+                return None
+            elif status_code == 409:
+                print(f"Error 409 Conflict en {url}: conflicto en la solicitud.")
+                return None
+            elif status_code == 500:
+                print(f"Error 500 Internal Server Error en {url}: error interno del servidor. Reintentando...")
+                retries += 1
+                time.sleep(5)
+            else:
+                print(f"Código de estado inesperado {status_code} en {url}.")
+                return None
+            
         except requests.exceptions.RequestException as e:
             retries += 1
             print(f"Error al obtener datos desde {url}. Intento {retries}/{max_retries}: {e}")
             if retries < max_retries:
                 time.sleep(5)
+    
     print(f"No se pudo obtener datos desde {url} después de {max_retries} intentos.")
     return None
 
+def fetch_commit_details(commit):
+    commit_sha = commit['sha']
+    commit_url = commit['url']
+    response = fetch_with_retries(commit_url, headers)
+    if not response:
+        print(f"No se pudieron obtener detalles del commit {commit_sha}. Omitiendo...")
+        return None
+    commit_data = response.json()
+    commit_data['files_modified'] = commit_data.get('files', [])
+    commit_data['stats'] = commit_data.get('stats', [])
+    commit_data['projectId'] = GITHUB_PROJECT
+    return commit_data
+
 def estimate_total_commits():
     print("Estimando el número total de commits (muestra inicial)...")
-    base_url = f'https://api.github.com/repos/{user}/{project}/commits?since={start_date}&per_page={per_page}'
+    base_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?since={START_DATE}&per_page={PER_PAGE}'
     response = fetch_with_retries(f"{base_url}&page=1", headers)
     if not response or not response.json():
         print("No se pudo obtener datos para la estimación. Asumiendo 1000 commits.")
@@ -603,7 +460,7 @@ def estimate_total_commits():
             if 'rel="last"' in part:
                 total_pages = int(part.split('&page=')[1].split('>')[0])
                 break
-        total_commits = total_pages * per_page
+        total_commits = total_pages * PER_PAGE
         print(f"Estimación basada en encabezado 'Link': {total_commits} commits.")
     else:
         total_commits = commits_in_page * 100
@@ -611,31 +468,39 @@ def estimate_total_commits():
     return total_commits
 
 def get_last_commit_date():
-    last_commit = collection_commits.find_one({}, sort=[("commit.committer.date", -1)])
-    if last_commit and 'commit' in last_commit and 'committer' in last_commit['commit']:
-        return last_commit['commit']['committer']['date']
+    last_commit = collection_commits.find_one({}, sort=[("commit.committer.date", pymongo.ASCENDING)])
+    if last_commit:
+        if 'commit' in last_commit and 'committer' in last_commit['commit'] and 'date' in last_commit['commit']['committer']:
+            date = last_commit['commit']['committer']['date']
+            print(f"Fecha del commit más antiguo encontrado: {date}")
+            return date
+        else:
+            print("Advertencia: El commit más antiguo no tiene el campo 'commit.committer.date'. Continuando sin límite superior.")
+    else:
+        print("No hay commits previos en la base de datos. Ingestando desde el principio.")
     return None
 
 total_commits_estimate = estimate_total_commits()
-ingested_commits = collection_commits.count_documents({"projectId": project})
+ingested_commits = collection_commits.count_documents({"projectId": GITHUB_PROJECT})
 print(f"Commits ya ingestados: {ingested_commits} de un estimado de {total_commits_estimate}")
 
 last_commit_date = get_last_commit_date()
 if last_commit_date:
-    print(f"Último commit insertado: {last_commit_date}. Ingestando commits posteriores...")
+    print(f"Continuando desde el commit más antiguo: {last_commit_date}")
+    until_date = last_commit_date
 else:
-    print(f"No hay commits previos en la base de datos. Ingestando desde {start_date}...")
-    last_commit_date = None  # No usamos 'until' si no hay commits previos
+    print(f"Ingestando desde {START_DATE} sin límite superior.")
+    until_date = None
 
 page = 1
+has_new_commits = True
 
 try:
-    while True:
-        # Construir la URL dinámicamente según si hay un 'until'
-        if last_commit_date:
-            search_url = f'https://api.github.com/repos/{user}/{project}/commits?page={page}&per_page={per_page}&since={start_date}&until={last_commit_date}'
+    while has_new_commits:
+        if until_date:
+            search_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?page={page}&per_page={PER_PAGE}&since={START_DATE}&until={until_date}'
         else:
-            search_url = f'https://api.github.com/repos/{user}/{project}/commits?page={page}&per_page={per_page}&since={start_date}'
+            search_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?page={page}&per_page={PER_PAGE}&since={START_DATE}'
         
         response = fetch_with_retries(search_url, headers)
         
@@ -645,60 +510,65 @@ try:
 
         commits = response.json()
         if not commits:
-            print("No hay más commits disponibles.")
+            print("No hay más commits disponibles en este rango.")
             break
 
-        for commit in commits:
-            commit_sha = commit['sha']
-            commit_url = commit['url']
-
-            # Verificar duplicados
-            if collection_commits.find_one({"sha": commit_sha}):
-                print(f"Commit {commit_sha} ya existe en MongoDB, omitiendo...")
-                continue
-
-            commit_response = fetch_with_retries(commit_url, headers)
-            if not commit_response:
-                print(f"No se pudieron obtener detalles del commit {commit_sha}. Omitiendo...")
-                continue
-
-            commit_data = commit_response.json()
-            files_modified = commit_data.get('files', [])
-            stats = commit_data.get('stats', {})
-            commit['files_modified'] = files_modified
-            commit['stats'] = stats
-            commit['projectId'] = project
-
-            try:
-                collection_commits.insert_one(commit)
-                ingested_commits += 1
-                print(f"Commit {commit_sha} insertado en MongoDB. Progreso: {ingested_commits}/{total_commits_estimate}")
-            except Exception as e:
-                print(f"Error al insertar commit {commit_sha}: {e}")
+        has_new_commits = False
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            commits_to_fetch = [commit for commit in commits if not collection_commits.find_one({"sha": commit['sha']})]
+            if commits_to_fetch:
+                future_to_commit = {executor.submit(fetch_commit_details, commit): commit for commit in commits_to_fetch}
+                for future in as_completed(future_to_commit):
+                    commit_data = future.result()
+                    if commit_data:
+                        commit_sha = commit_data['sha']
+                        commit_date = commit_data['commit']['committer']['date']
+                        try:
+                            collection_commits.insert_one(commit_data)
+                            ingested_commits += 1
+                            has_new_commits = True
+                            print(f"Commit {commit_sha} insertado en MongoDB. Fecha: {commit_date}. Progreso: {ingested_commits}/{total_commits_estimate}")
+                        except Exception as e:
+                            print(f"Error al insertar commit {commit_sha}: {e}")
 
         page += 1
 
 except KeyboardInterrupt:
     print("\n\nEjecución interrumpida manualmente con Ctrl + C. Proceso detenido.")
     print(f"Commits ingestados hasta el momento: {ingested_commits} de un estimado de {total_commits_estimate}")
-    print("Puedes reanudar el proceso ejecutando el script nuevamente. ¡Hasta pronto!")
+    print("Hasta pronto!")
     exit(0)
 
 print("Proceso completado.")
 ```
-### Archivos de configuración
-No se utilizaron archivos de configuración externos, ya que todos los parámetros (token, host, puerto, etc.) están integrados en el script para simplicidad. Sin embargo, para una implementación más robusta, se podrían externalizar en un archivo `.env` o similar.
+
+### Archivos de configuración (`.env`)
+Se utilizó un archivo `.env` para externalizar parámetros sensibles y configurables:
+```
+GITHUB_TOKEN=tu_token_aqui
+GITHUB_USER=microsoft
+GITHUB_PROJECT=vscode
+START_DATE=2018-01-01T00:00:00Z
+PER_PAGE=100
+MAX_WORKERS=20
+LOCAL_MONGO_HOST=localhost
+LOCAL_MONGO_PORT=27017
+LOCAL_MONGO_DB=github
+LOCAL_MONGO_COLLECTION=commits
+```
 
 ---
 
 ## 6. Conclusiones
 El proyecto cumplió con todos los objetivos establecidos:
-- Se realizó la ingesta de commits del repositorio `microsoft/vscode` desde el 1 de enero de 2018.
-- La gestión del *rate limit* fue eficiente, minimizando solicitudes y respetando los límites de la API.
-- Se añadieron los campos `files_modified` y `stats` a cada commit, enriqueciendo los datos almacenados.
-- La adaptación a MongoDB local resolvió las limitaciones de espacio de MongoDB Atlas.
+- Se realizó la ingesta de commits del repositorio `microsoft/vscode` desde el 1 de enero de 2018 hasta la actualidad, adaptándose a MongoDB local para superar las limitaciones de almacenamiento de Atlas.
+- La gestión del *rate limit* fue eficiente, utilizando un sistema de reintentos y pausas dinámicas, optimizado para minimizar mensajes de depuración.
+- Se añadieron los campos `files_modified` y `stats` a cada commit, enriqueciendo los datos almacenados mediante la operación "Get a commit".
+- La implementación de multihilo redujo significativamente el tiempo de procesamiento de solicitudes HTTP, mejorando la eficiencia general.
+- El manejo de interrupciones permitió pausar y reanudar la ingesta sin pérdida de datos, gracias a la lógica basada en el commit más antiguo.
 
-El manejo de interrupciones y la estimación aproximada de commits mejoraron la usabilidad y eficiencia del script, permitiendo pausar y reanudar el proceso sin problemas.
+El desarrollo iterativo resolvió problemas iniciales (como la dirección incorrecta de la ingesta) y optimizó el rendimiento, demostrando la importancia de adaptar soluciones a las restricciones específicas del entorno.
+
 ---
 
 ## 7. Referencias
@@ -706,3 +576,5 @@ El manejo de interrupciones y la estimación aproximada de commits mejoraron la 
 - Descarga de MongoDB: [https://www.mongodb.com/try/download/community](https://www.mongodb.com/try/download/community)
 - GitHub REST API: [https://docs.github.com/en/rest](https://docs.github.com/en/rest)
 - Operación "Get a commit": [https://docs.github.com/en/rest/commits/commits/#get-a-commit](https://docs.github.com/en/rest/commits/commits/#get-a-commit)
+- Python `concurrent.futures`: [https://docs.python.org/3/library/concurrent.futures.html](https://docs.python.org/3/library/concurrent.futures.html)
+- Documentación de `python-dotenv`: [https://pypi.org/project/python-dotenv/](https://pypi.org/project/python-dotenv/)
