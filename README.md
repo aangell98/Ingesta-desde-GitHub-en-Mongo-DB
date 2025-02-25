@@ -1,7 +1,7 @@
 # Memoria: Práctica 3 - Gestión de Datos
 ## Ingesta de Commits desde GitHub en MongoDB Local
 
-**Autor:** Angel Luis Lara, Fernando Martin, Daniel Salas, Ingrid Niveiro  
+**Autores:** Angel Luis Lara, Fernando Martin, Daniel Salas, Ingrid Niveiro  
 **Asignatura:** Gestión de Datos  
 **Profesor:** Ricardo Pérez del Castillo  
 **Fecha:** 24 de febrero de 2025  
