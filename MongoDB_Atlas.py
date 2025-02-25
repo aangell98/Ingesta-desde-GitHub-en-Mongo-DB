@@ -9,16 +9,24 @@ import os
 # Cargar variables de entorno desde .env
 load_dotenv()
 
-# Configuración desde .env
+# Configuración desde .env con valores por defecto
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER")
-GITHUB_PROJECT = os.getenv("GITHUB_PROJECT")
-START_DATE = os.getenv("START_DATE")
-PER_PAGE = int(os.getenv("PER_PAGE"))
+GITHUB_USER = os.getenv("GITHUB_USER", "microsoft")
+GITHUB_PROJECT = os.getenv("GITHUB_PROJECT", "vscode")
+START_DATE = os.getenv("START_DATE", "2018-01-01T00:00:00Z")
+PER_PAGE = int(os.getenv("PER_PAGE", "100"))
 
 MONGODB_URI = os.getenv("ATLAS_MONGO_URI")
-DB_NAME = os.getenv("ATLAS_MONGO_DB")
-COLLECTION_NAME = os.getenv("ATLAS_MONGO_COLLECTION")
+DB_NAME = os.getenv("ATLAS_MONGO_DB", "github")
+COLLECTION_NAME = os.getenv("ATLAS_MONGO_COLLECTION", "commits")
+
+# Verificación de variables críticas
+if not GITHUB_TOKEN:
+    print("Error: GITHUB_TOKEN no está definido en el archivo .env")
+    exit(1)
+if not MONGODB_URI:
+    print("Error: ATLAS_MONGO_URI no está definido en el archivo .env")
+    exit(1)
 
 headers = {
     "Authorization": f"token {GITHUB_TOKEN}",
@@ -70,13 +78,33 @@ def fetch_with_retries(url, headers, max_retries=3, timeout=10):
         check_rate_limit()
         try:
             response = requests.get(url, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            return response
+            status_code = response.status_code
+            
+            if status_code == 200:
+                return response
+            elif status_code == 400:
+                print(f"Error 400 Bad Request en {url}: solicitud inválida.")
+                return None
+            elif status_code == 404:
+                print(f"Error 404 Resource Not Found en {url}: recurso no encontrado.")
+                return None
+            elif status_code == 409:
+                print(f"Error 409 Conflict en {url}: conflicto en la solicitud.")
+                return None
+            elif status_code == 500:
+                print(f"Error 500 Internal Server Error en {url}: error interno del servidor. Reintentando...")
+                retries += 1
+                time.sleep(5)
+            else:
+                print(f"Código de estado inesperado {status_code} en {url}.")
+                return None
+            
         except requests.exceptions.RequestException as e:
             retries += 1
             print(f"Error al obtener datos desde {url}. Intento {retries}/{max_retries}: {e}")
             if retries < max_retries:
                 time.sleep(5)
+    
     print(f"No se pudo obtener datos desde {url} después de {max_retries} intentos.")
     return None
 
@@ -104,9 +132,17 @@ def estimate_total_commits():
     return total_commits
 
 def get_last_commit_date():
-    last_commit = collection_commits.find_one({}, sort=[("commit.committer.date", -1)])
-    if last_commit and 'commit' in last_commit and 'committer' in last_commit['commit']:
-        return last_commit['commit']['committer']['date']
+    # Buscar el commit con la fecha más antigua para usarlo como 'since'
+    last_commit = collection_commits.find_one({}, sort=[("commit.committer.date", pymongo.ASCENDING)])
+    if last_commit:
+        if 'commit' in last_commit and 'committer' in last_commit['commit'] and 'date' in last_commit['commit']['committer']:
+            date = last_commit['commit']['committer']['date']
+            print(f"Fecha del commit más antiguo encontrado: {date}")
+            return date
+        else:
+            print("Advertencia: El commit más antiguo no tiene el campo 'commit.committer.date'. Continuando sin límite superior.")
+    else:
+        print("No hay commits previos en la base de datos. Ingestando desde el principio.")
     return None
 
 total_commits_estimate = estimate_total_commits()
@@ -115,20 +151,18 @@ print(f"Commits ya ingestados: {ingested_commits} de un estimado de {total_commi
 
 last_commit_date = get_last_commit_date()
 if last_commit_date:
-    print(f"Último commit insertado: {last_commit_date}. Ingestando commits posteriores...")
+    print(f"Continuando desde el commit más antiguo: {last_commit_date}")
+    since_date = last_commit_date
 else:
-    print(f"No hay commits previos en la base de datos. Ingestando desde {START_DATE}...")
-    last_commit_date = None
+    print(f"Ingestando desde {START_DATE} sin límite superior.")
+    since_date = START_DATE
 
 page = 1
+has_new_commits = True
 
 try:
-    while True:
-        if last_commit_date:
-            search_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?page={page}&per_page={PER_PAGE}&since={START_DATE}&until={last_commit_date}'
-        else:
-            search_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?page={page}&per_page={PER_PAGE}&since={START_DATE}'
-        
+    while has_new_commits:
+        search_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?page={page}&per_page={PER_PAGE}&since={since_date}'
         response = fetch_with_retries(search_url, headers)
         
         if not response or not response.json():
@@ -137,12 +171,14 @@ try:
 
         commits = response.json()
         if not commits:
-            print("No hay más commits disponibles.")
+            print("No hay más commits disponibles en este rango.")
             break
 
+        has_new_commits = False
         for commit in commits:
             commit_sha = commit['sha']
             commit_url = commit['url']
+
             if collection_commits.find_one({"sha": commit_sha}):
                 print(f"Commit {commit_sha} ya existe en MongoDB, omitiendo...")
                 continue
@@ -153,16 +189,16 @@ try:
                 continue
 
             commit_data = commit_response.json()
-            files_modified = commit_data.get('files', [])
-            stats = commit_data.get('stats', {})
-            commit['files_modified'] = files_modified
-            commit['stats'] = stats
-            commit['projectId'] = GITHUB_PROJECT
+            commit_data['files_modified'] = commit_data.get('files', [])
+            commit_data['stats'] = commit_data.get('stats', [])
+            commit_data['projectId'] = GITHUB_PROJECT
 
             try:
-                collection_commits.insert_one(commit)
+                commit_date = commit_data['commit']['committer']['date']
+                collection_commits.insert_one(commit_data)
                 ingested_commits += 1
-                print(f"Commit {commit_sha} insertado en MongoDB. Progreso: {ingested_commits}/{total_commits_estimate}")
+                has_new_commits = True
+                print(f"Commit {commit_sha} insertado en MongoDB. Fecha: {commit_date}. Progreso: {ingested_commits}/{total_commits_estimate}")
             except Exception as e:
                 print(f"Error al insertar commit {commit_sha}: {e}")
 
