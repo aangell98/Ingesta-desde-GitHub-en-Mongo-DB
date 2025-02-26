@@ -129,9 +129,9 @@ def fetch_commit_details(commit):
     commit_data['projectId'] = GITHUB_PROJECT
     return commit_data
 
-def estimate_total_commits():
+def estimate_total_commits(start_date=START_DATE):
     print("Estimando el número total de commits (muestra inicial)...")
-    base_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?since={START_DATE}&per_page={PER_PAGE}'
+    base_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?since={start_date}&per_page={PER_PAGE}'
     response = fetch_with_retries(f"{base_url}&page=1", headers)
     if not response or not response.json():
         print("No se pudo obtener datos para la estimación. Asumiendo 1000 commits.")
@@ -162,6 +162,16 @@ def get_newest_commit_date():
     newest_commit = collection_commits.find_one({}, sort=[("commit.committer.date", pymongo.DESCENDING)])
     if newest_commit and 'commit' in newest_commit and 'committer' in newest_commit['commit'] and 'date' in newest_commit['commit']['committer']:
         return newest_commit['commit']['committer']['date']
+    return None
+
+def get_newest_date_before_oldest(oldest_date):
+    """Obtiene la fecha del commit más reciente que sea anterior a oldest_date."""
+    newest_before_oldest = collection_commits.find_one(
+        {"commit.committer.date": {"$lt": oldest_date}},
+        sort=[("commit.committer.date", pymongo.DESCENDING)]
+    )
+    if newest_before_oldest and 'commit' in newest_before_oldest and 'committer' in newest_before_oldest['commit'] and 'date' in newest_before_oldest['commit']['committer']:
+        return newest_before_oldest['commit']['committer']['date']
     return None
 
 def ingest_first_time():
@@ -199,6 +209,7 @@ def ingest_first_time():
                 break
 
             has_new_commits = False
+            print(f"Página {page}: Encontrados {len(commits)} commits en la respuesta de la API")
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 commits_to_fetch = [commit for commit in commits if not collection_commits.find_one({"sha": commit['sha']})]
                 if commits_to_fetch:
@@ -297,23 +308,115 @@ def ingest_new_commits():
     print(f"Commits nuevos ingestados en esta ejecución: {new_commits_count}")
     print(f"Nuevo total de commits en la base de datos: {ingested_commits_after}")
 
+def ingest_older_commits():
+    ingested_commits = collection_commits.count_documents({"projectId": GITHUB_PROJECT})
+    print(f"Commits actualmente en la base de datos: {ingested_commits}")
+
+    oldest_date = get_last_commit_date()
+    if not oldest_date:
+        print("No hay commits previos en la base de datos. Por favor, ejecuta la opción 1 primero.")
+        return
+
+    print(f"Fecha del commit más antiguo actual: {oldest_date}")
+    print("Por favor, introduce la fecha hasta la cual deseas ampliar la ingesta (formato: YYYY-MM-DDTHH:MM:SSZ, ej. 2017-01-01T00:00:00Z):")
+    new_start_date = input("Nueva fecha de inicio: ")
+    try:
+        # Validar formato de la fecha ingresada
+        datetime.strptime(new_start_date, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        print("Formato de fecha inválido. Usa YYYY-MM-DDTHH:MM:SSZ (ej. 2017-01-01T00:00:00Z).")
+        return
+
+    # Verificar que la nueva fecha sea anterior al commit más antiguo existente
+    new_start_date_dt = datetime.strptime(new_start_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    oldest_date_dt = datetime.strptime(oldest_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    if new_start_date_dt >= oldest_date_dt:
+        print(f"La nueva fecha de inicio ({new_start_date}) debe ser anterior al commit más antiguo actual ({oldest_date}).")
+        return
+
+    # Obtener el commit más reciente anterior a oldest_date como punto de continuación
+    newest_before_oldest = get_newest_date_before_oldest(oldest_date)
+    if newest_before_oldest:
+        print(f"Continuando desde el commit más reciente antes de {oldest_date}: {newest_before_oldest}")
+        since_date = newest_before_oldest
+    else:
+        print(f"No hay commits previos a {oldest_date} en la base de datos. Iniciando desde {new_start_date}")
+        since_date = new_start_date
+
+    print(f"Ampliando ingesta desde {since_date} hasta {oldest_date}")
+    page = 1
+    has_new_commits = True
+    new_commits_count = 0
+
+    try:
+        while has_new_commits:
+            search_url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_PROJECT}/commits?page={page}&per_page={PER_PAGE}&since={since_date}&until={oldest_date}'
+            response = fetch_with_retries(search_url, headers)
+            
+            if not response or not response.json():
+                print(f"No se encontraron más commits en el rango {since_date} a {oldest_date} o ocurrió un error.")
+                break
+
+            commits = response.json()
+            print(f"Página {page}: Encontrados {len(commits)} commits en la respuesta de la API")
+            if not commits:
+                print("No hay más commits disponibles en este rango.")
+                break
+
+            has_new_commits = False
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                commits_to_fetch = [commit for commit in commits if not collection_commits.find_one({"sha": commit['sha']})]
+                print(f"Página {page}: {len(commits_to_fetch)} commits nuevos para procesar")
+                if commits_to_fetch:
+                    future_to_commit = {executor.submit(fetch_commit_details, commit): commit for commit in commits_to_fetch}
+                    for future in as_completed(future_to_commit):
+                        commit_data = future.result()
+                        if commit_data:
+                            commit_sha = commit_data['sha']
+                            commit_date = commit_data['commit']['committer']['date']
+                            try:
+                                collection_commits.insert_one(commit_data)
+                                ingested_commits += 1
+                                new_commits_count += 1
+                                has_new_commits = True
+                                print(f"Commit {commit_sha} insertado en MongoDB (Antiguo). Fecha: {commit_date}")
+                            except Exception as e:
+                                print(f"Error al insertar commit {commit_sha}: {e}")
+
+            page += 1
+
+    except KeyboardInterrupt:
+        print("\n\nEjecución interrumpida manualmente con Ctrl + C. Proceso detenido.")
+        print(f"Commits nuevos ingestados en esta ejecución: {new_commits_count}")
+        print(f"Nuevo total de commits en la base de datos: {ingested_commits}")
+        print("Hasta pronto!")
+        exit(0)
+
+    ingested_commits_after = collection_commits.count_documents({"projectId": GITHUB_PROJECT})
+    print(f"Ampliación de ingesta completada.")
+    print(f"Commits nuevos ingestados en esta ejecución: {new_commits_count}")
+    print(f"Nuevo total de commits en la base de datos: {ingested_commits_after}")
+
 def show_menu():
     while True:
         print("\n=== Menú de Ingesta de Commits ===")
-        print("1. Es la primera vez que ejecuto este programa o deseo continuar una ejecución anterior")
+        print("1. Es la primera vez que ejecuto este programa o deseo continuar una ejecución (INICIAL) anterior")
         print("2. Actualizar con nuevos commits recientes")
-        print("3. Salir")
-        choice = input("Selecciona una opción (1-3): ")
+        print("3. Ampliar ingesta con commits mas antiguos")
+        print("4. Salir")
+        choice = input("Selecciona una opción (1-4): ")
 
         if choice == "1":
             ingest_first_time()
         elif choice == "2":
             ingest_new_commits()
         elif choice == "3":
+            ingest_older_commits()
+        elif choice == "4":
             print("Saliendo del programa. ¡Hasta pronto!")
             break
         else:
-            print("Opción inválida. Por favor, selecciona 1, 2 o 3.")
+            print("Opción inválida. Por favor, selecciona 1, 2, 3 o 4.")
 
 if __name__ == "__main__":
     show_menu()
