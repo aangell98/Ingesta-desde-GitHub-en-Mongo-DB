@@ -236,7 +236,7 @@ except KeyboardInterrupt:
 - **Actualización de nuevos commits**: Opción 2 agrega commits desde el más reciente hasta el presente, deteniéndose al encontrar duplicados, con advertencia al usuario.
 - **Ampliación hacia atrás**: Opción 3 permite extender la ingesta desde una fecha anterior ingresada por el usuario hasta el commit más antiguo existente, continuando desde el último commit insertado tras interrupciones usando `get_newest_date_before_oldest`.
 
-**Últiamas modificaciones:**
+**Últimas modificaciones:**
 - Por último, se agregaron las siguientes modificaciones:
    - Integración de las versiones Local y Atlas con selección al inicio para simplificar la estructura del proyecto integrando las versiones para MongoDB Local y MongoDB Atlas en un solo archivo .py, permitiendo al usuario elegir la conexión al inicio de la ejecución.
    - Medición del tiempo de ejecución que toma cada operación de ingesta desde que se selecciona una opción hasta que finaliza o se interrumpe, mostrando el resultado en horas, minutos y segundos. Si se interrumpe se guarda el tiempo empleado para que al reejecutarlo empiece a contar desde ahí.
