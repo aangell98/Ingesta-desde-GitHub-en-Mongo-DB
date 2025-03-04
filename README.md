@@ -789,9 +789,8 @@ El proyecto cumplió con todos los objetivos establecidos:
 - Se realizó la ingesta de commits del repositorio `microsoft/vscode` desde el 1 de enero de 2018 hasta la actualidad (v1.2.0), con capacidades añadidas para actualizar commits recientes y ampliar hacia fechas anteriores (v1.3.0).
 - La gestión del *rate limit* fue eficiente, optimizada en v1.2.0 con reintentos, pausas dinámicas y mensajes reducidos.
 - Se añadieron los campos `files_modified` y `stats` a cada commit mediante "Get a commit".
-- La implementación de multihilo (v1.2.0) mejoró significativamente el rendimiento, y el menú interactivo (v1.3.0) добавил flexibilidad para diferentes casos de uso.
+- La implementación de multihilo (v1.2.0) mejoró significativamente el rendimiento y el menú interactivo (v1.3.0) mejoró la flexibilidad para diferentes casos de uso.
 - El manejo de interrupciones permitió pausar y reanudar la ingesta sin pérdida de datos, con una solución robusta para la Opción 3 en v1.3.0 que asegura continuidad tras interrupciones.
-
 El desarrollo iterativo resolvió problemas iniciales y optimizó la experiencia del usuario, demostrando la importancia de adaptar soluciones a requisitos cambiantes.
 
 ---
