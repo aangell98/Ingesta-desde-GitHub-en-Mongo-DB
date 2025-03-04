@@ -791,7 +791,6 @@ El proyecto cumplió con todos los objetivos establecidos:
 - Se añadieron los campos `files_modified` y `stats` a cada commit mediante "Get a commit".
 - La implementación de multihilo (v1.2.0) mejoró significativamente el rendimiento y el menú interactivo (v1.3.0) mejoró la flexibilidad para diferentes casos de uso.
 - El manejo de interrupciones permitió pausar y reanudar la ingesta sin pérdida de datos, con una solución robusta para la Opción 3 en v1.3.0 que asegura continuidad tras interrupciones.
-g
 El desarrollo iterativo resolvió problemas iniciales y optimizó la experiencia del usuario, demostrando la importancia de adaptar soluciones a requisitos cambiantes.
 
 ---
