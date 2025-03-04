@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 
 # Cargar variables de entorno desde .env
 load_dotenv()
@@ -20,8 +21,12 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 
 MONGODB_HOST = os.getenv("LOCAL_MONGO_HOST", "localhost")
 MONGODB_PORT = int(os.getenv("LOCAL_MONGO_PORT", "27017"))
+MONGODB_URI = os.getenv("ATLAS_MONGO_URI")
 DB_NAME = os.getenv("LOCAL_MONGO_DB", "github")
 COLLECTION_NAME = os.getenv("LOCAL_MONGO_COLLECTION", "commits")
+
+# Archivo para guardar el tiempo acumulado
+TIME_FILE = "ingestion_time.json"
 
 # Verificación de variables críticas
 if not GITHUB_TOKEN:
@@ -33,15 +38,40 @@ headers = {
     "Accept": "application/vnd.github.v3+json"
 }
 
-# Conexión a MongoDB local
-try:
-    client = MongoClient(MONGODB_HOST, MONGODB_PORT)
-    db = client[DB_NAME]
-    collection_commits = db[COLLECTION_NAME]
-    print("Conexión exitosa a MongoDB local.")
-except Exception as e:
-    print(f"Error al conectar a MongoDB local: {e}")
-    exit(1)
+# Selección de conexión a MongoDB
+def connect_to_mongodb():
+    print("\n=== Selección de Base de Datos ===")
+    print("1. Conectar a MongoDB Local")
+    print("2. Conectar a MongoDB Atlas")
+    choice = input("Selecciona una opción (1-2): ")
+
+    if choice == "1":
+        try:
+            client = MongoClient(MONGODB_HOST, MONGODB_PORT)
+            print("Conexión exitosa a MongoDB Local.")
+            return client
+        except Exception as e:
+            print(f"Error al conectar a MongoDB Local: {e}")
+            exit(1)
+    elif choice == "2":
+        if not MONGODB_URI:
+            print("Error: ATLAS_MONGO_URI no está definido en el archivo .env")
+            exit(1)
+        try:
+            client = MongoClient(MONGODB_URI)
+            print("Conexión exitosa a MongoDB Atlas.")
+            return client
+        except Exception as e:
+            print(f"Error al conectar a MongoDB Atlas: {e}")
+            exit(1)
+    else:
+        print("Opción inválida. Saliendo del programa.")
+        exit(1)
+
+# Conexión global
+client = connect_to_mongodb()
+db = client[DB_NAME]
+collection_commits = db[COLLECTION_NAME]
 
 # Contador para mensajes de rate limit
 request_count = 0
@@ -165,7 +195,6 @@ def get_newest_commit_date():
     return None
 
 def get_newest_date_before_oldest(oldest_date):
-    """Obtiene la fecha del commit más reciente que sea anterior a oldest_date."""
     newest_before_oldest = collection_commits.find_one(
         {"commit.committer.date": {"$lt": oldest_date}},
         sort=[("commit.committer.date", pymongo.DESCENDING)]
@@ -174,7 +203,23 @@ def get_newest_date_before_oldest(oldest_date):
         return newest_before_oldest['commit']['committer']['date']
     return None
 
-def ingest_first_time():
+def load_previous_time():
+    if os.path.exists(TIME_FILE):
+        with open(TIME_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get("elapsed_time", 0)
+    return 0
+
+def save_time(elapsed_time):
+    with open(TIME_FILE, 'w') as f:
+        json.dump({"elapsed_time": elapsed_time}, f)
+
+def delete_time_file():
+    if os.path.exists(TIME_FILE):
+        os.remove(TIME_FILE)
+
+def ingest_first_time(start_time):
+    previous_time = load_previous_time()
     total_commits_estimate = estimate_total_commits()
     ingested_commits = collection_commits.count_documents({"projectId": GITHUB_PROJECT})
     print(f"Commits ya ingestados: {ingested_commits} de un estimado de {total_commits_estimate}")
@@ -230,14 +275,24 @@ def ingest_first_time():
             page += 1
 
     except KeyboardInterrupt:
+        elapsed_time = previous_time + (time.time() - start_time)
+        save_time(elapsed_time)
         print("\n\nEjecución interrumpida manualmente con Ctrl + C. Proceso detenido.")
+        hours, remainder = divmod(int(elapsed_time), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"Tiempo de ejecución acumulado hasta la interrupción: {hours} horas, {minutes} minutos y {seconds} segundos")
         print(f"Commits ingestados hasta el momento: {ingested_commits} de un estimado de {total_commits_estimate}")
         print("Hasta pronto!")
         exit(0)
 
-    print("Proceso completado.")
+    elapsed_time = previous_time + (time.time() - start_time)
+    delete_time_file()
+    hours, remainder = divmod(int(elapsed_time), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"Proceso completado en {hours} horas, {minutes} minutos y {seconds} segundos")
 
-def ingest_new_commits():
+def ingest_new_commits(start_time):
+    previous_time = load_previous_time()
     ingested_commits_before = collection_commits.count_documents({"projectId": GITHUB_PROJECT})
     print(f"Commits actualmente en la base de datos: {ingested_commits_before}")
 
@@ -297,18 +352,25 @@ def ingest_new_commits():
             page += 1
 
     except KeyboardInterrupt:
+        elapsed_time = previous_time + (time.time() - start_time)
+        save_time(elapsed_time)
         print("\n\nEjecución interrumpida manualmente con Ctrl + C. Proceso detenido.")
+        hours, remainder = divmod(int(elapsed_time), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"Tiempo de ejecución acumulado hasta la interrupción: {hours} horas, {minutes} minutos y {seconds} segundos")
         print(f"Commits nuevos ingestados en esta ejecución: {new_commits_count}")
         print(f"Nuevo total de commits en la base de datos: {ingested_commits_before}")
         print("Hasta pronto!")
         exit(0)
 
-    ingested_commits_after = collection_commits.count_documents({"projectId": GITHUB_PROJECT})
-    print(f"Ingesta de nuevos commits completada.")
-    print(f"Commits nuevos ingestados en esta ejecución: {new_commits_count}")
-    print(f"Nuevo total de commits en la base de datos: {ingested_commits_after}")
+    elapsed_time = previous_time + (time.time() - start_time)
+    delete_time_file()  # Eliminar el archivo si la ingesta se completa
+    hours, remainder = divmod(int(elapsed_time), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"Ingesta de nuevos commits completada en {hours} horas, {minutes} minutos y {seconds} segundos")
 
-def ingest_older_commits():
+def ingest_older_commits(start_time):
+    previous_time = load_previous_time()
     ingested_commits = collection_commits.count_documents({"projectId": GITHUB_PROJECT})
     print(f"Commits actualmente en la base de datos: {ingested_commits}")
 
@@ -386,16 +448,22 @@ def ingest_older_commits():
             page += 1
 
     except KeyboardInterrupt:
+        elapsed_time = previous_time + (time.time() - start_time)
+        save_time(elapsed_time)
         print("\n\nEjecución interrumpida manualmente con Ctrl + C. Proceso detenido.")
+        hours, remainder = divmod(int(elapsed_time), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"Tiempo de ejecución acumulado hasta la interrupción: {hours} horas, {minutes} minutos y {seconds} segundos")
         print(f"Commits nuevos ingestados en esta ejecución: {new_commits_count}")
         print(f"Nuevo total de commits en la base de datos: {ingested_commits}")
         print("Hasta pronto!")
         exit(0)
 
-    ingested_commits_after = collection_commits.count_documents({"projectId": GITHUB_PROJECT})
-    print(f"Ampliación de ingesta completada.")
-    print(f"Commits nuevos ingestados en esta ejecución: {new_commits_count}")
-    print(f"Nuevo total de commits en la base de datos: {ingested_commits_after}")
+    elapsed_time = previous_time + (time.time() - start_time)
+    delete_time_file()  # Eliminar el archivo si la ingesta se completa
+    hours, remainder = divmod(int(elapsed_time), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"Ampliación de ingesta completada en {hours} horas, {minutes} minutos y {seconds} segundos")
 
 def show_menu():
     while True:
@@ -406,12 +474,14 @@ def show_menu():
         print("4. Salir")
         choice = input("Selecciona una opción (1-4): ")
 
+        start_time = time.time()  # Iniciar el cronómetro al seleccionar una opción
+
         if choice == "1":
-            ingest_first_time()
+            ingest_first_time(start_time)
         elif choice == "2":
-            ingest_new_commits()
+            ingest_new_commits(start_time)
         elif choice == "3":
-            ingest_older_commits()
+            ingest_older_commits(start_time)
         elif choice == "4":
             print("Saliendo del programa. ¡Hasta pronto!")
             break
