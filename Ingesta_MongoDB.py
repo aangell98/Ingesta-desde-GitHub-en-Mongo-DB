@@ -12,7 +12,7 @@ import json
 load_dotenv()
 
 # Configuración desde .env con valores por defecto
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_TOKENS = os.getenv("GITHUB_TOKENS", os.getenv("GITHUB_TOKEN")).split(",")  # Lista de tokens, fallback a GITHUB_TOKEN
 GITHUB_USER = os.getenv("GITHUB_USER", "microsoft")
 GITHUB_PROJECT = os.getenv("GITHUB_PROJECT", "vscode")
 START_DATE = os.getenv("START_DATE", "2018-01-01T00:00:00Z")
@@ -29,12 +29,14 @@ COLLECTION_NAME = os.getenv("LOCAL_MONGO_COLLECTION", "commits")
 TIME_FILE = "ingestion_time.json"
 
 # Verificación de variables críticas
-if not GITHUB_TOKEN:
-    print("Error: GITHUB_TOKEN no está definido en el archivo .env")
+if not GITHUB_TOKENS or not GITHUB_TOKENS[0]:
+    print("Error: GITHUB_TOKENS o GITHUB_TOKEN no está definido en el archivo .env")
     exit(1)
 
+# Índice del token actual y encabezados iniciales
+current_token_index = 0
 headers = {
-    "Authorization": f"token {GITHUB_TOKEN}",
+    "Authorization": f"token {GITHUB_TOKENS[current_token_index]}",
     "Accept": "application/vnd.github.v3+json"
 }
 
@@ -77,22 +79,28 @@ collection_commits = db[COLLECTION_NAME]
 request_count = 0
 
 def check_rate_limit(threshold=100):
-    global request_count
+    global request_count, current_token_index, headers
     rate_url = 'https://api.github.com/rate_limit'
     max_retries = 3
     retries = 0
     
     while retries < max_retries:
         try:
-            response = requests.get(rate_url, headers=headers, timeout=10)
+            response = requests.get(rate_url, headers=headers, timeout=30)
             response.raise_for_status()
             rate_limit = response.json()
             remaining = rate_limit['resources']['core']['remaining']
             reset_time = rate_limit['resources']['core']['reset']
             request_count += 1
             if request_count % 10 == 0 or remaining < threshold:
-                print(f"Peticiones restantes: {remaining}, próximo reset: {time.ctime(reset_time)}")
+                print(f"Peticiones restantes con token actual ({GITHUB_TOKENS[current_token_index][:8]}...): {remaining}, próximo reset: {time.ctime(reset_time)}")
             if remaining < threshold:
+                if len(GITHUB_TOKENS) > 1:  # Si hay más de un token
+                    current_token_index = (current_token_index + 1) % len(GITHUB_TOKENS)
+                    headers["Authorization"] = f"token {GITHUB_TOKENS[current_token_index]}"
+                    print(f"El límite de tasa se ha agotado. Cambiando automáticamente al token {GITHUB_TOKENS[current_token_index][:8]}...")
+                    return check_rate_limit(threshold)  # Reintentar con el nuevo token
+                # Si solo hay un token, esperar
                 sleep_time = max(reset_time - int(time.time()) + 5, 0)
                 hours, remainder = divmod(sleep_time, 3600)
                 minutes, seconds = divmod(remainder, 60)
@@ -110,7 +118,7 @@ def check_rate_limit(threshold=100):
     time.sleep(sleep_time)
     return None
 
-def fetch_with_retries(url, headers, max_retries=3, timeout=10):
+def fetch_with_retries(url, headers=headers, max_retries=3, timeout=30):
     retries = 0
     while retries < max_retries:
         check_rate_limit()
@@ -132,17 +140,22 @@ def fetch_with_retries(url, headers, max_retries=3, timeout=10):
             elif status_code == 500:
                 print(f"Error 500 Internal Server Error en {url}: error interno del servidor. Reintentando...")
                 retries += 1
-                time.sleep(5)
+                time.sleep(2 ** retries)  # Backoff exponencial: 2, 4, 8 segundos
             else:
                 print(f"Código de estado inesperado {status_code} en {url}.")
                 return None
             
+        except requests.exceptions.ConnectTimeout as e:
+            retries += 1
+            print(f"Timeout de conexión en {url}. Intento {retries}/{max_retries}: {e}")
+            if retries < max_retries:
+                time.sleep(2 ** retries)  # Backoff exponencial
         except requests.exceptions.RequestException as e:
             retries += 1
             print(f"Error al obtener datos desde {url}. Intento {retries}/{max_retries}: {e}")
             if retries < max_retries:
-                time.sleep(5)
-    
+                time.sleep(2 ** retries)  # Backoff exponencial
+  
     print(f"No se pudo obtener datos desde {url} después de {max_retries} intentos.")
     return None
 
@@ -364,7 +377,7 @@ def ingest_new_commits(start_time):
         exit(0)
 
     elapsed_time = previous_time + (time.time() - start_time)
-    delete_time_file()  # Eliminar el archivo si la ingesta se completa
+    delete_time_file()
     hours, remainder = divmod(int(elapsed_time), 3600)
     minutes, seconds = divmod(remainder, 60)
     print(f"Ingesta de nuevos commits completada en {hours} horas, {minutes} minutos y {seconds} segundos")
@@ -383,20 +396,17 @@ def ingest_older_commits(start_time):
     print("Por favor, introduce la fecha hasta la cual deseas ampliar la ingesta (formato: YYYY-MM-DDTHH:MM:SSZ, ej. 2017-01-01T00:00:00Z):")
     new_start_date = input("Nueva fecha de inicio: ")
     try:
-        # Validar formato de la fecha ingresada
         datetime.strptime(new_start_date, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
         print("Formato de fecha inválido. Usa YYYY-MM-DDTHH:MM:SSZ (ej. 2017-01-01T00:00:00Z).")
         return
 
-    # Verificar que la nueva fecha sea anterior al commit más antiguo existente
     new_start_date_dt = datetime.strptime(new_start_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     oldest_date_dt = datetime.strptime(oldest_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     if new_start_date_dt >= oldest_date_dt:
         print(f"La nueva fecha de inicio ({new_start_date}) debe ser anterior al commit más antiguo actual ({oldest_date}).")
         return
 
-    # Obtener el commit más reciente anterior a oldest_date como punto de continuación
     newest_before_oldest = get_newest_date_before_oldest(oldest_date)
     if newest_before_oldest:
         print(f"Continuando desde el commit más reciente antes de {oldest_date}: {newest_before_oldest}")
@@ -460,7 +470,7 @@ def ingest_older_commits(start_time):
         exit(0)
 
     elapsed_time = previous_time + (time.time() - start_time)
-    delete_time_file()  # Eliminar el archivo si la ingesta se completa
+    delete_time_file()
     hours, remainder = divmod(int(elapsed_time), 3600)
     minutes, seconds = divmod(remainder, 60)
     print(f"Ampliación de ingesta completada en {hours} horas, {minutes} minutos y {seconds} segundos")
@@ -474,7 +484,7 @@ def show_menu():
         print("4. Salir")
         choice = input("Selecciona una opción (1-4): ")
 
-        start_time = time.time()  # Iniciar el cronómetro al seleccionar una opción
+        start_time = time.time()
 
         if choice == "1":
             ingest_first_time(start_time)
