@@ -127,7 +127,7 @@ headers = {
 La API de GitHub no proporciona un conteo exacto de commits en un rango de fechas, por lo que se implementó una estimación basada en el encabezado `Link` (mejorada en v1.2.0):
 - Se realizó una solicitud inicial a la primera página de commits desde `START_DATE` con `per_page=100`.
 - Se extrajo el número de la última página del encabezado `Link` para calcular el total aproximado (`total_pages * PER_PAGE`).
-- Si el encabezado no estaba disponible, se asumió un valor aproximado multiplicando la cantidad de commits en la primera página por 100.
+- Si el encabezado no estaba disponible, se asumió un valor aproximado multiplicando la cantidad de commits en la primera página por 100
 
 Código relevante:
 ```python
